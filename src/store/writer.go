@@ -1,8 +1,9 @@
 package store
 
 import (
-	"encoding/json"
 	"fmt"
+	"kvstash/src/constants"
+	"kvstash/src/models"
 	"log"
 	"os"
 	"path/filepath"
@@ -61,19 +62,35 @@ func NewLogWriter(dbPath string) *LogWriter {
 	return &LogWriter{file: file, offset: info.Size()}
 }
 
-func (lw *LogWriter) Write(data json.RawMessage) (int64, int, error) {
+func (lw *LogWriter) Write(data []byte) (int64, int64, error) {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
 
-	log.Printf("Write: Writing at %v", lw.offset)
-	offset := lw.offset
-	n, err := lw.file.WriteAt(data, offset)
+	metaDataOffset := lw.offset
+	valueOffset := metaDataOffset + constants.MetadataSize
+	valueSize := int64(len(data))
+	metadata := models.KVStashMetadata{}
+	metadata.ComputeChecksum(valueOffset, valueSize, "active.log", data)
+
+	log.Printf("Write: Writing metadata at %v", metaDataOffset)
+	n, err := lw.file.WriteAt(metadata.Serialize(), metaDataOffset)
 	if err != nil {
-		return 0, 0, fmt.Errorf("Write: %w", err)
+		return 0, 0, fmt.Errorf("Write: metadata write failed %w", err)
+	}
+	
+	if n != constants.MetadataSize {
+		log.Printf("expected size: %v, recvd size: %v", constants.MetadataSize, n)
+		return 0, 0, fmt.Errorf("Write: metadata size inconsistent")
+	}
+
+	lw.offset += constants.MetadataSize
+	n, err = lw.file.WriteAt([]byte(data), valueOffset)
+	if err != nil {
+		return 0, 0, fmt.Errorf("Write: value write failed %w", err)
 	}
 	lw.offset += int64(n)
 
-	return offset, n, nil
+	return valueOffset, valueSize, nil
 }
 
 func (lw *LogWriter) Close() error {

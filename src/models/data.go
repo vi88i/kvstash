@@ -1,7 +1,7 @@
 package models
 
 type KVStashRequest struct {
-	Key   string          `json:"key"`
+	Key   string `json:"key"`
 	Value string `json:"value"`
 }
 
