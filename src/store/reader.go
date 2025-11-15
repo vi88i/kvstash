@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 )
 
+// fetchValue reads a value from the log file at the specified offset and size
+// It validates inputs, reads the exact bytes, and deserializes the JSON data
+// Returns the value string or an error if validation or read fails
 func fetchValue(dbPath string, fileName string, offset int64, size int64) (string, error) {
 	// Validate inputs
 	if size <= 0 {

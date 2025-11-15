@@ -11,57 +11,58 @@ import (
 )
 
 /*
+Log Writer Design Notes:
+
 Requirements:
 - Multiple writers
 - Multiple readers
-- Durability vs Throughput
+- Durability vs Throughput trade-off
 
-1. Throughput inversely proportional to durability
-    A         B
-f.Write()  f.Write()
-f.Write()  f.Sync()
-f.Write()  f.Write()
-f.Sync()   f.Sync()
-           f.Write()
+1. Durability vs Throughput:
+   When opened with O_SYNC, file writes are synchronous (high durability, lower throughput)
+   Without O_SYNC, kernel batches writes (higher throughput, lower durability)
 
-Sync() - this step is used to flush the file metadata and data written to the file to the disk
-we need not call it explicitly, the kernel internally does it for us (batching)
-Reason: Writing to disk is expensive, so it is often done in batches to improve performance
-If we want high durability (B), we need to compromise on throughput (call sync after every write, synchronous I/O)
-If we want high throughput (A), we need to compromise on durability (are we okay with losing some writes on power outage?)
-
-When file is opened with O_SYNC it enables synchronous I/O
-
-2. Multiple writers
-???
-
-3. Multiple Readers
-???
+2. Thread Safety:
+   Mutex protects concurrent writes from multiple goroutines
 */
 
+// LogWriter handles thread-safe append operations to the active log file
+// It maintains the current offset and ensures synchronous writes for durability
 type LogWriter struct {
-	file   *os.File
+	// file is the open file handle for the active log file
+	file *os.File
+
+	// offset tracks the current write position in the file
 	offset int64
-	mu     sync.Mutex
+
+	// mu protects concurrent write operations
+	mu sync.Mutex
 }
 
-func NewLogWriter(dbPath string) *LogWriter {
-	logPath := filepath.Join(dbPath, "active.log")
+// newLogWriter creates a new LogWriter for the specified database path
+// Opens the file with O_SYNC for synchronous I/O (durability over throughput)
+// Returns an error if the file cannot be opened or queried
+func newLogWriter(dbPath string) (*LogWriter, error) {
+	logPath := filepath.Join(dbPath, constants.ActiveLogFileName)
 
 	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_SYNC|os.O_WRONLY, 0644)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("newLogWriter: failed to open file: %w", err)
 	}
 
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
-		panic(err)
+		return nil, fmt.Errorf("newLogWriter: failed to stat file: %w", err)
 	}
 
-	return &LogWriter{file: file, offset: info.Size()}
+	return &LogWriter{file: file, offset: info.Size()}, nil
 }
 
+// Write appends data to the log file with metadata and checksums
+// The write format is: [metadata (112 bytes)][value data]
+// Returns the value offset, value size, and any error encountered
+// Thread-safe: uses mutex to serialize concurrent writes
 func (lw *LogWriter) Write(data []byte) (int64, int64, error) {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
@@ -70,35 +71,37 @@ func (lw *LogWriter) Write(data []byte) (int64, int64, error) {
 	valueOffset := metaDataOffset + constants.MetadataSize
 	valueSize := int64(len(data))
 	metadata := models.KVStashMetadata{}
-	metadata.ComputeChecksum(valueOffset, valueSize, "active.log", data)
+	metadata.ComputeChecksum(valueOffset, valueSize, constants.ActiveLogFileName, data)
 
 	log.Printf("Write: Writing metadata at %v", metaDataOffset)
 	n, err := lw.file.WriteAt(metadata.Serialize(), metaDataOffset)
 	if err != nil {
-		return 0, 0, fmt.Errorf("Write: metadata write failed %w", err)
+		return 0, 0, fmt.Errorf("Write: metadata write failed: %w", err)
 	}
-	
+
 	if n != constants.MetadataSize {
-		log.Printf("expected size: %v, recvd size: %v", constants.MetadataSize, n)
+		log.Printf("Write: expected size: %v, recvd size: %v", constants.MetadataSize, n)
 		return 0, 0, fmt.Errorf("Write: metadata size inconsistent")
 	}
 
 	lw.offset += constants.MetadataSize
 	n, err = lw.file.WriteAt([]byte(data), valueOffset)
 	if err != nil {
-		return 0, 0, fmt.Errorf("Write: value write failed %w", err)
+		return 0, 0, fmt.Errorf("Write: value write failed: %w", err)
 	}
 	lw.offset += int64(n)
 
 	return valueOffset, valueSize, nil
 }
 
+// Close closes the log file and releases the file handle
+// Returns an error if the close operation fails
 func (lw *LogWriter) Close() error {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
 
 	if err := lw.file.Close(); err != nil {
-		return err
+		return fmt.Errorf("Close: failed to close file: %w", err)
 	}
 
 	return nil
