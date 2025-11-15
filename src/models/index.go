@@ -10,6 +10,9 @@ type KVStashIndexEntry struct {
 
 	// Size is the length in bytes of the value data
 	Size int64
+
+	// Checksum holds the SHA-256 checksum of the entry
+	Checksum [32]byte
 }
 
 // KVStashIndex is a map from keys to their storage locations

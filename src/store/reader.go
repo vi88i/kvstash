@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kvstash/src/models"
@@ -9,10 +10,15 @@ import (
 	"path/filepath"
 )
 
+// ErrChecksumMismatch indicates that the stored data does not match its checksum
+// This suggests data corruption and the entry should be purged from the index
+var ErrChecksumMismatch = errors.New("checksum mismatch: data corrupted")
+
 // fetchValue reads a value from the log file at the specified offset and size
 // It validates inputs, reads the exact bytes, and deserializes the JSON data
 // Returns the value string or an error if validation or read fails
-func fetchValue(dbPath string, fileName string, offset int64, size int64) (string, error) {
+// Returns ErrChecksumMismatch if the data checksum doesn't match the stored checksum
+func fetchValue(dbPath string, fileName string, offset int64, size int64, checksum [32]byte) (string, error) {
 	// Validate inputs
 	if size <= 0 {
 		return "", fmt.Errorf("fetchValue: size must be positive, got %d", size)
@@ -62,6 +68,14 @@ func fetchValue(dbPath string, fileName string, offset int64, size int64) (strin
 	var data models.KVStashRequest
 	if err := json.Unmarshal(buf, &data); err != nil {
 		return "", fmt.Errorf("fetchValue: failed to deserialize data - %w", err)
+	}
+
+	// Validate data integrity by recomputing and comparing checksums
+	var metadata models.KVStashMetadata
+	metadata.ComputeChecksum(offset, size, fileName, buf)
+	if metadata.Checksum != checksum {
+		return "", fmt.Errorf("fetchValue: %w (expected %x, got %x)",
+			ErrChecksumMismatch, checksum, metadata.Checksum)
 	}
 
 	return data.Value, nil

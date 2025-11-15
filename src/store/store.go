@@ -4,6 +4,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kvstash/src/constants"
@@ -90,6 +91,7 @@ func (s *Store) Set(req *models.KVStashRequest) error {
 
 // Get retrieves the value for a given key from the store
 // The operation is thread-safe using a read lock on the index
+// If a checksum mismatch is detected, the corrupted entry is purged from the index
 // Returns an error if the key is not found or the read operation fails
 func (s *Store) Get(req *models.KVStashRequest) (string, error) {
 	s.mu.RLock()
@@ -100,8 +102,16 @@ func (s *Store) Get(req *models.KVStashRequest) (string, error) {
 		return "", fmt.Errorf("Get: key not found in index")
 	}
 
-	value, err := fetchValue(s.dbPath, entry.SegmentFile, entry.Offset, entry.Size)
+	value, err := fetchValue(s.dbPath, entry.SegmentFile, entry.Offset, entry.Size, entry.Checksum)
 	if err != nil {
+		// Check if this is a checksum mismatch error
+		if errors.Is(err, ErrChecksumMismatch) {
+			// Purge the corrupted entry from the index
+			s.mu.Lock()
+			delete(s.index, req.Key)
+			s.mu.Unlock()
+			log.Printf("Get: purged corrupted entry for key=%v due to checksum mismatch", req.Key)
+		}
 		return "", fmt.Errorf("Get: %w", err)
 	}
 
@@ -184,6 +194,7 @@ func (s *Store) buildIndex() error {
 			SegmentFile: constants.ActiveLogFileName,
 			Offset:      metadata.Offset,
 			Size:        metadata.Size,
+			Checksum:    metadata.Checksum,
 		}
 	}
 
