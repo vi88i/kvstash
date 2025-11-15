@@ -17,10 +17,10 @@ import (
 
 // Validation errors that should result in HTTP 400 responses
 var (
-	ErrEmptyKey       = errors.New("key should not be empty")
-	ErrKeyTooLarge    = errors.New("key exceeds maximum size")
-	ErrValueTooLarge  = errors.New("value exceeds maximum size")
-	ErrKeyNotFound    = errors.New("key not found in index")
+	ErrEmptyKey      = errors.New("key should not be empty")
+	ErrKeyTooLarge   = errors.New("key exceeds maximum size")
+	ErrValueTooLarge = errors.New("value exceeds maximum size")
+	ErrKeyNotFound   = errors.New("key not found in index")
 )
 
 // Store manages the key-value storage with thread-safe access

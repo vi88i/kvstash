@@ -60,8 +60,8 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("apiHandler: failed to set key: %v", err)
 			// Check if this is a validation error (400) or server error (500)
 			if errors.Is(err, store.ErrEmptyKey) ||
-			   errors.Is(err, store.ErrKeyTooLarge) ||
-			   errors.Is(err, store.ErrValueTooLarge) {
+				errors.Is(err, store.ErrKeyTooLarge) ||
+				errors.Is(err, store.ErrValueTooLarge) {
 				sendResponse(http.StatusBadRequest, false, err.Error(), nil)
 			} else {
 				sendResponse(http.StatusInternalServerError, false, "write failed", nil)
