@@ -3,6 +3,7 @@ package svc
 
 import (
 	"encoding/json"
+	"errors"
 	"kvstash/src/models"
 	"kvstash/src/store"
 	"log"
@@ -19,66 +20,79 @@ var kvStore *store.Store
 func apiHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	var err error
-	var reqData models.KVStashRequest
-	var respData = models.KVStashResponse{
-		Success: false,
+	// Helper function to send JSON response
+	sendResponse := func(statusCode int, success bool, message string, data *models.KVStashRequest) {
+		w.WriteHeader(statusCode)
+		respData := models.KVStashResponse{
+			Success: success,
+			Message: message,
+			Data:    data,
+		}
+		if err := json.NewEncoder(w).Encode(respData); err != nil {
+			log.Printf("apiHandler: failed to encode response: %v", err)
+		}
 	}
 
+	// Validate HTTP method
 	if !slices.Contains([]string{http.MethodPost, http.MethodGet}, r.Method) {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		goto send
+		sendResponse(http.StatusMethodNotAllowed, false, "", nil)
+		return
 	}
 
-	err = json.NewDecoder(r.Body).Decode(&reqData)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		respData.Message = "invalid json body"
+	// Decode request body
+	var reqData models.KVStashRequest
+	if err := json.NewDecoder(r.Body).Decode(&reqData); err != nil {
 		log.Printf("apiHandler: failed to decode request body: %v", err)
-		goto send
+		sendResponse(http.StatusBadRequest, false, "invalid json body", nil)
+		return
 	}
 
 	switch r.Method {
 	case http.MethodPost:
+		// Validate value is non-empty
 		if len(reqData.Value) == 0 {
-			w.WriteHeader(http.StatusBadRequest)
-			respData.Message = "value should be non-empty"
-			goto send
+			sendResponse(http.StatusBadRequest, false, "value should be non-empty", nil)
+			return
 		}
 
+		// Attempt to set key-value pair
 		if err := kvStore.Set(&reqData); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			respData.Message = "write failed"
 			log.Printf("apiHandler: failed to set key: %v", err)
-			goto send
+			// Check if this is a validation error (400) or server error (500)
+			if errors.Is(err, store.ErrEmptyKey) ||
+			   errors.Is(err, store.ErrKeyTooLarge) ||
+			   errors.Is(err, store.ErrValueTooLarge) {
+				sendResponse(http.StatusBadRequest, false, err.Error(), nil)
+			} else {
+				sendResponse(http.StatusInternalServerError, false, "write failed", nil)
+			}
+			return
 		}
 
-		w.WriteHeader(http.StatusCreated)
-		respData.Success = true
+		sendResponse(http.StatusCreated, true, "", nil)
+
 	case http.MethodGet:
+		// Attempt to get value
 		value, err := kvStore.Get(&reqData)
 		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			respData.Message = "read failed"
 			log.Printf("apiHandler: failed to get key: %v", err)
-			goto send
+			// Check if key not found (404) or server error (500)
+			if errors.Is(err, store.ErrKeyNotFound) {
+				sendResponse(http.StatusNotFound, false, "key not found", nil)
+			} else {
+				sendResponse(http.StatusInternalServerError, false, "read failed", nil)
+			}
+			return
 		}
 
-		w.WriteHeader(http.StatusOK)
-		respData.Success = true
-		respData.Data = &models.KVStashRequest{
+		sendResponse(http.StatusOK, true, "", &models.KVStashRequest{
 			Key:   reqData.Key,
 			Value: value,
-		}
-	default:
-		w.WriteHeader(http.StatusInternalServerError)
-		respData.Message = "unable to process request"
-	}
+		})
 
-send:
-	json.
-		NewEncoder(w).
-		Encode(respData)
+	default:
+		sendResponse(http.StatusInternalServerError, false, "unable to process request", nil)
+	}
 }
 
 // StartHTTPServer initializes and starts the HTTP server on port 8080

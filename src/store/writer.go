@@ -63,7 +63,7 @@ func newLogWriter(dbPath string) (*LogWriter, error) {
 // The write format is: [metadata (112 bytes)][value data]
 // Returns the value offset, value size, and any error encountered
 // Thread-safe: uses mutex to serialize concurrent writes
-func (lw *LogWriter) Write(data []byte) (int64, int64, error) {
+func (lw *LogWriter) Write(data []byte) (*models.KVStashMetadata, error) {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
 
@@ -71,27 +71,31 @@ func (lw *LogWriter) Write(data []byte) (int64, int64, error) {
 	valueOffset := metaDataOffset + constants.MetadataSize
 	valueSize := int64(len(data))
 	metadata := models.KVStashMetadata{}
-	metadata.ComputeChecksum(valueOffset, valueSize, constants.ActiveLogFileName, data)
+	if err := metadata.ComputeChecksum(valueOffset, valueSize, constants.ActiveLogFileName, data); err != nil {
+		return &metadata, fmt.Errorf("Write: metadata compute failed: %w", err)
+	}
 
 	log.Printf("Write: Writing metadata at %v", metaDataOffset)
 	n, err := lw.file.WriteAt(metadata.Serialize(), metaDataOffset)
 	if err != nil {
-		return 0, 0, fmt.Errorf("Write: metadata write failed: %w", err)
+		return &metadata, fmt.Errorf("Write: metadata write failed: %w", err)
 	}
 
 	if n != constants.MetadataSize {
 		log.Printf("Write: expected size: %v, recvd size: %v", constants.MetadataSize, n)
-		return 0, 0, fmt.Errorf("Write: metadata size inconsistent")
+		return &metadata, fmt.Errorf("Write: metadata size inconsistent")
 	}
 
 	lw.offset += constants.MetadataSize
 	n, err = lw.file.WriteAt([]byte(data), valueOffset)
-	if err != nil {
-		return 0, 0, fmt.Errorf("Write: value write failed: %w", err)
+	bytesWritten := int64(n)
+	if err != nil || bytesWritten != metadata.Size {
+		lw.offset -= constants.MetadataSize
+		return &metadata, fmt.Errorf("Write: value write failed: %w", err)
 	}
 	lw.offset += int64(n)
 
-	return valueOffset, valueSize, nil
+	return &metadata, nil
 }
 
 // Close closes the log file and releases the file handle

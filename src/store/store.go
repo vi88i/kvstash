@@ -15,6 +15,14 @@ import (
 	"sync"
 )
 
+// Validation errors that should result in HTTP 400 responses
+var (
+	ErrEmptyKey       = errors.New("key should not be empty")
+	ErrKeyTooLarge    = errors.New("key exceeds maximum size")
+	ErrValueTooLarge  = errors.New("value exceeds maximum size")
+	ErrKeyNotFound    = errors.New("key not found in index")
+)
+
 // Store manages the key-value storage with thread-safe access
 // It maintains an in-memory index for fast lookups and uses a log writer for persistence
 type Store struct {
@@ -33,8 +41,14 @@ type Store struct {
 
 // NewStore creates and initializes a new Store instance
 // It builds the index by reading the existing log file and initializes the writer
+// Creates the database directory if it doesn't exist
 // Returns an error if the index cannot be built or the writer cannot be created
 func NewStore(dbPath string) (*Store, error) {
+	// Create database directory if it doesn't exist
+	if err := os.MkdirAll(dbPath, 0755); err != nil {
+		return nil, fmt.Errorf("NewStore: failed to create database directory: %w", err)
+	}
+
 	s := &Store{
 		index:  make(models.KVStashIndex),
 		dbPath: dbPath,
@@ -55,25 +69,26 @@ func NewStore(dbPath string) (*Store, error) {
 
 // Set stores a key-value pair in the store
 // The operation is thread-safe and validates key/value size limits
-// Returns an error if validation fails or the write operation fails
+// Returns validation errors (ErrEmptyKey, ErrKeyTooLarge, ErrValueTooLarge) for client errors
+// Returns other errors for server-side failures
 func (s *Store) Set(req *models.KVStashRequest) error {
 	if len(req.Key) == 0 {
-		return fmt.Errorf("Set: key should not be empty")
+		return ErrEmptyKey
 	}
 
 	if len(req.Key) > constants.MaxKeySize {
-		return fmt.Errorf("Set: key exceeds maximum size of %d bytes", constants.MaxKeySize)
+		return fmt.Errorf("%w (%d bytes)", ErrKeyTooLarge, constants.MaxKeySize)
 	}
 
 	if len(req.Value) > constants.MaxValueSize {
-		return fmt.Errorf("Set: value exceeds maximum size of %d bytes", constants.MaxValueSize)
+		return fmt.Errorf("%w (%d bytes)", ErrValueTooLarge, constants.MaxValueSize)
 	}
 
 	data, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("Set: failed to serialize: %w", err)
 	}
-	offset, size, err := s.writer.Write(data)
+	metadata, err := s.writer.Write(data)
 	if err != nil {
 		return fmt.Errorf("Set: %w", err)
 	}
@@ -81,8 +96,9 @@ func (s *Store) Set(req *models.KVStashRequest) error {
 	s.mu.Lock()
 	s.index[req.Key] = &models.KVStashIndexEntry{
 		SegmentFile: constants.ActiveLogFileName,
-		Offset:      int64(offset),
-		Size:        int64(size),
+		Offset:      metadata.Offset,
+		Size:        metadata.Size,
+		Checksum:    metadata.Checksum,
 	}
 	s.mu.Unlock()
 
@@ -92,14 +108,15 @@ func (s *Store) Set(req *models.KVStashRequest) error {
 // Get retrieves the value for a given key from the store
 // The operation is thread-safe using a read lock on the index
 // If a checksum mismatch is detected, the corrupted entry is purged from the index
-// Returns an error if the key is not found or the read operation fails
+// Returns ErrKeyNotFound for missing keys (client error)
+// Returns other errors for server-side failures
 func (s *Store) Get(req *models.KVStashRequest) (string, error) {
 	s.mu.RLock()
 	entry, ok := s.index[req.Key]
 	s.mu.RUnlock()
 
 	if !ok {
-		return "", fmt.Errorf("Get: key not found in index")
+		return "", ErrKeyNotFound
 	}
 
 	value, err := fetchValue(s.dbPath, entry.SegmentFile, entry.Offset, entry.Size, entry.Checksum)
@@ -142,6 +159,7 @@ func (s *Store) buildIndex() error {
 
 			// if n > 0
 			log.Println("buildIndex: truncated metadata")
+			break
 		}
 
 		if err != nil {

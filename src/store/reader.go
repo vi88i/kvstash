@@ -31,11 +31,6 @@ func fetchValue(dbPath string, fileName string, offset int64, size int64, checks
 	// Construct full file path
 	filePath := filepath.Join(dbPath, fileName)
 
-	// Check if file exists
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		return "", fmt.Errorf("fetchValue: file does not exist: %s", filePath)
-	}
-
 	// Open the file for reading
 	file, err := os.Open(filePath)
 	if err != nil {

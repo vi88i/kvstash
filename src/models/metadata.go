@@ -40,16 +40,34 @@ func (m *KVStashMetadata) ComputeChecksum(offset int64, size int64, fileName str
 
 	var buf1, buf2 bytes.Buffer
 
-	binary.Write(&buf1, binary.BigEndian, offset)
-	binary.Write(&buf1, binary.BigEndian, size)
-	binary.Write(&buf1, binary.BigEndian, fileNameBytes)
-	binary.Write(&buf1, binary.BigEndian, data)
+	// Compute value checksum: SHA-256(offset || size || fileName || data)
+	if err := binary.Write(&buf1, binary.BigEndian, offset); err != nil {
+		return fmt.Errorf("ComputeChecksum: failed to write offset: %w", err)
+	}
+	if err := binary.Write(&buf1, binary.BigEndian, size); err != nil {
+		return fmt.Errorf("ComputeChecksum: failed to write size: %w", err)
+	}
+	if err := binary.Write(&buf1, binary.BigEndian, fileNameBytes); err != nil {
+		return fmt.Errorf("ComputeChecksum: failed to write fileName: %w", err)
+	}
+	if err := binary.Write(&buf1, binary.BigEndian, data); err != nil {
+		return fmt.Errorf("ComputeChecksum: failed to write data: %w", err)
+	}
 	valueChecksum := sha256.Sum256(buf1.Bytes())
 
-	binary.Write(&buf2, binary.BigEndian, offset)
-	binary.Write(&buf2, binary.BigEndian, size)
-	binary.Write(&buf2, binary.BigEndian, fileNameBytes)
-	binary.Write(&buf2, binary.BigEndian, valueChecksum)
+	// Compute metadata checksum: SHA-256(offset || size || fileName || valueChecksum)
+	if err := binary.Write(&buf2, binary.BigEndian, offset); err != nil {
+		return fmt.Errorf("ComputeChecksum: failed to write offset for metadata: %w", err)
+	}
+	if err := binary.Write(&buf2, binary.BigEndian, size); err != nil {
+		return fmt.Errorf("ComputeChecksum: failed to write size for metadata: %w", err)
+	}
+	if err := binary.Write(&buf2, binary.BigEndian, fileNameBytes); err != nil {
+		return fmt.Errorf("ComputeChecksum: failed to write fileName for metadata: %w", err)
+	}
+	if err := binary.Write(&buf2, binary.BigEndian, valueChecksum); err != nil {
+		return fmt.Errorf("ComputeChecksum: failed to write valueChecksum: %w", err)
+	}
 	metadataChecksum := sha256.Sum256(buf2.Bytes())
 
 	m.Offset = offset
@@ -103,10 +121,18 @@ func (m *KVStashMetadata) Deserialize(data []byte) error {
 func (m *KVStashMetadata) ValidateMChecksum() error {
 	var buf bytes.Buffer
 
-	binary.Write(&buf, binary.BigEndian, m.Offset)
-	binary.Write(&buf, binary.BigEndian, m.Size)
-	binary.Write(&buf, binary.BigEndian, m.SegmentFile)
-	binary.Write(&buf, binary.BigEndian, m.Checksum)
+	if err := binary.Write(&buf, binary.BigEndian, m.Offset); err != nil {
+		return fmt.Errorf("ValidateMChecksum: failed to write offset: %w", err)
+	}
+	if err := binary.Write(&buf, binary.BigEndian, m.Size); err != nil {
+		return fmt.Errorf("ValidateMChecksum: failed to write size: %w", err)
+	}
+	if err := binary.Write(&buf, binary.BigEndian, m.SegmentFile); err != nil {
+		return fmt.Errorf("ValidateMChecksum: failed to write segmentFile: %w", err)
+	}
+	if err := binary.Write(&buf, binary.BigEndian, m.Checksum); err != nil {
+		return fmt.Errorf("ValidateMChecksum: failed to write checksum: %w", err)
+	}
 
 	if sha256.Sum256(buf.Bytes()) != m.MChecksum {
 		return fmt.Errorf("ValidateMChecksum: metadata corrupted")
