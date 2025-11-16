@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"kvstash/src/models"
+	"kvstash/models"
 	"os"
 	"path/filepath"
 )

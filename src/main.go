@@ -2,9 +2,9 @@
 package main
 
 import (
-	"kvstash/src/constants"
-	"kvstash/src/store"
-	"kvstash/src/svc"
+	"kvstash/constants"
+	"kvstash/store"
+	"kvstash/svc"
 	"log"
 )
 

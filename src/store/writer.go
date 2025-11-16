@@ -2,8 +2,8 @@ package store
 
 import (
 	"fmt"
-	"kvstash/src/constants"
-	"kvstash/src/models"
+	"kvstash/constants"
+	"kvstash/models"
 	"log"
 	"os"
 	"path/filepath"

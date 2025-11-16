@@ -4,8 +4,8 @@ package svc
 import (
 	"encoding/json"
 	"errors"
-	"kvstash/src/models"
-	"kvstash/src/store"
+	"kvstash/models"
+	"kvstash/store"
 	"log"
 	"net/http"
 	"slices"

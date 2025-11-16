@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"kvstash/src/constants"
+	"kvstash/constants"
 )
 
 // KVStashMetadata represents the metadata for a log entry
