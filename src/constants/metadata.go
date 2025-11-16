@@ -7,10 +7,7 @@ const (
 	MetadataSize = 112
 
 	// DBPath is the directory path where database files are stored
-	DBPath = "db"
-
-	// ActiveLogFileName is the name of the active log file where new entries are appended
-	ActiveLogFileName = "active.log"
+	DBPath = "../db"
 
 	// MaxKeySize is the maximum allowed size in bytes for a key
 	MaxKeySize = 256 // 256 bytes

@@ -38,14 +38,20 @@ type Store struct {
 	// writer handles appending new entries to the active log file
 	writer *LogWriter
 
-	// mu protects concurrent access to the index
+	// mu protects concurrent access to the index, activeLog, activeLogCount, segmentCount, and writer
 	mu sync.RWMutex
 
 	// dbPath is the directory where database files are stored
 	dbPath string
 
-	// segmentCount tracks the number of archived segments present
+	// segmentCount tracks the total number of segments (including active log)
 	segmentCount int
+
+	// activeLog tracks the active log file name
+	activeLog string
+
+	// activeLogCount tracks the number of writes to the active log (includes updates to existing keys)
+	activeLogCount int
 }
 
 // segmentFile represents a numbered segment file in the database
@@ -58,7 +64,7 @@ type segmentFile struct {
 }
 
 // NewStore creates and initializes a new Store instance
-// It builds the index by reading the existing log file and initializes the writer
+// It builds the index by reading all existing segment files and initializes the writer for the active log
 // Creates the database directory if it doesn't exist
 // Returns an error if the index cannot be built or the writer cannot be created
 func NewStore(dbPath string) (*Store, error) {
@@ -71,13 +77,14 @@ func NewStore(dbPath string) (*Store, error) {
 		index:        make(models.KVStashIndex),
 		dbPath:       dbPath,
 		segmentCount: 0,
+		activeLog:    "seg0.log",
 	}
 
 	if err := s.buildIndex(); err != nil {
 		return nil, fmt.Errorf("NewStore: failed to build index: %w", err)
 	}
 
-	writer, err := newLogWriter(dbPath)
+	writer, err := newLogWriter(dbPath, s.activeLog)
 	if err != nil {
 		return nil, fmt.Errorf("NewStore: failed to create writer: %w", err)
 	}
@@ -88,9 +95,13 @@ func NewStore(dbPath string) (*Store, error) {
 
 // Set stores a key-value pair in the store
 // The operation is thread-safe and validates key/value size limits
+// Automatically rotates to a new segment when the active log reaches MaxKeysPerSegment writes
 // Returns validation errors (ErrEmptyKey, ErrKeyTooLarge, ErrValueTooLarge) for client errors
 // Returns other errors for server-side failures
 func (s *Store) Set(req *models.KVStashRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if len(req.Key) == 0 {
 		return ErrEmptyKey
 	}
@@ -103,6 +114,22 @@ func (s *Store) Set(req *models.KVStashRequest) error {
 		return fmt.Errorf("%w (%d bytes)", ErrValueTooLarge, constants.MaxValueSize)
 	}
 
+	if s.activeLogCount >= constants.MaxKeysPerSegment {
+		if err := s.Close(); err != nil {
+			return fmt.Errorf("Set: failed to close active log - %v: %w", s.activeLog, err)
+		}
+
+		activeLog := fmt.Sprintf("%v%v%v", constants.SegmentNamePrefix, s.segmentCount+1, constants.SegmentNameExt)
+		writer, err := newLogWriter(s.dbPath, activeLog)
+		if err != nil {
+			return fmt.Errorf("Set: failed to create new active log - %v: %w", activeLog, err)
+		}
+		s.writer = writer
+		s.activeLog = activeLog
+		s.activeLogCount = 0
+		s.segmentCount++
+	}
+
 	data, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("Set: failed to serialize: %w", err)
@@ -112,14 +139,13 @@ func (s *Store) Set(req *models.KVStashRequest) error {
 		return fmt.Errorf("Set: %w", err)
 	}
 
-	s.mu.Lock()
 	s.index[req.Key] = &models.KVStashIndexEntry{
-		SegmentFile: constants.ActiveLogFileName,
+		SegmentFile: s.activeLog,
 		Offset:      metadata.Offset,
 		Size:        metadata.Size,
 		Checksum:    metadata.Checksum,
 	}
-	s.mu.Unlock()
+	s.activeLogCount++
 
 	return nil
 }
@@ -154,9 +180,10 @@ func (s *Store) Get(req *models.KVStashRequest) (string, error) {
 	return value, nil
 }
 
-// buildIndex reconstructs the in-memory index by scanning the active log file
-// It reads all entries, validates their checksums, and populates the index
-// Returns an error if the file cannot be opened or read
+// buildIndex reconstructs the in-memory index by scanning all segment files
+// It reads all entries, validates metadata checksums only, and populates the index
+// Tolerates corruption in the active log but fails on corruption in archived segments
+// Returns an error if segment files cannot be opened or read
 func (s *Store) buildIndex() error {
 	segments, err := s.getSegmentFiles()
 	if err != nil {
@@ -171,7 +198,7 @@ func (s *Store) buildIndex() error {
 
 		if err := s.readSegment(file, segment); err != nil {
 			// don't tolerate checksum corruption in non-active log
-			if segment != constants.ActiveLogFileName {
+			if segment != s.activeLog {
 				s.index = make(models.KVStashIndex)
 				file.Close()
 				return fmt.Errorf("buildIndex: non-active log corrupted - %v: %w", segment, err)
@@ -188,14 +215,19 @@ func (s *Store) buildIndex() error {
 // Close closes the store and releases resources
 func (s *Store) Close() error {
 	if s.writer != nil {
-		return s.writer.Close()
+		err := s.writer.Close()
+		if err == nil {
+			s.writer = nil
+		}
+		return err
 	}
 	return nil
 }
 
 // getSegmentFiles scans the database directory and returns an ordered list of segment files
 // It returns segment files sorted by their numeric suffix (seg0.log, seg1.log, ...)
-// followed by the active log file. This ensures entries are read in chronological order.
+// Also determines and sets the active log filename based on existing segments
+// This ensures entries are read in chronological order during index building
 func (s *Store) getSegmentFiles() ([]string, error) {
 	dbDirPath := filepath.Join(s.dbPath)
 	entries, err := os.ReadDir(dbDirPath)
@@ -223,18 +255,25 @@ func (s *Store) getSegmentFiles() ([]string, error) {
 		return segments[i].num < segments[j].num
 	})
 
-	matches := make([]string, 0, len(segments)+1)
+	matches := make([]string, 0, len(segments))
 	for i := range segments {
 		matches = append(matches, segments[i].name)
 	}
-	s.segmentCount = len(matches)
-	matches = append(matches, constants.ActiveLogFileName)
+
+	noOfSegments := len(matches)
+	if noOfSegments > 0 {
+		s.segmentCount = noOfSegments
+		s.activeLog = fmt.Sprintf("%v%v%v", constants.SegmentNamePrefix, noOfSegments-1, constants.SegmentNameExt)
+	} else {
+		s.activeLog = fmt.Sprintf("%v0%v", constants.SegmentNamePrefix, constants.SegmentNameExt)
+	}
 
 	return matches, nil
 }
 
 // readSegment reads all entries from a segment file and populates the index
-// It validates metadata checksums and stops on the first corrupted entry
+// It validates metadata checksums and returns an error on the first corrupted entry
+// If reading the active log, it also increments activeLogCount for each entry found
 // Returns an error if the file cannot be read or contains invalid data
 func (s *Store) readSegment(file *os.File, segment string) error {
 	if file == nil {
@@ -301,6 +340,10 @@ func (s *Store) readSegment(file *os.File, segment string) error {
 			Offset:      metadata.Offset,
 			Size:        metadata.Size,
 			Checksum:    metadata.Checksum,
+		}
+
+		if s.activeLog == segment {
+			s.activeLogCount++
 		}
 	}
 }
