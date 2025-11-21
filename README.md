@@ -136,11 +136,14 @@ CompactionInterval = 60       // Compaction interval (seconds)
 - `404 Not Found` - Key doesn't exist
 - `500 Internal Server Error` - Delete failure
 
-**How Deletion Works:**
+**How Deletion Works (Soft Delete):**
 - Writes a tombstone record to the append-only log with the `FlagDeleted` marker
-- Removes the key from the in-memory index immediately
-- Tombstone is replayed during recovery to ensure deletions persist across restarts
-- Disk space is reclaimed during the next compaction cycle
+- Marks the key in the in-memory index with `Deleted=true` (soft delete)
+- Key remains in index pointing to tombstone location (ensures compaction works even when all keys deleted)
+- GET operations return 404 Not Found for soft-deleted keys
+- Tombstone is replayed during recovery to restore the `Deleted=true` state
+- During compaction, soft-deleted entries are skipped and not copied to the new store
+- Physical disk space is reclaimed when old segments are removed during compaction
 
 ### Example Usage
 
@@ -184,21 +187,29 @@ KVStash uses an append-only log with the following structure:
 - Checksum (32 bytes) - SHA-256 of value data
 - MChecksum (32 bytes) - SHA-256 of metadata
 
-### Tombstone Deletion
+### Tombstone Deletion (Soft Delete)
 
-When a key is deleted, a tombstone record is written to the log:
+KVStash uses a **soft-delete** approach where deleted keys remain in the index but are marked as deleted.
 
 **Tombstone Structure:**
 - Metadata with `FlagDeleted` (bit 0 set)
 - Value contains only the key: `{"key":"username","value":""}`
 - Size reflects the JSON-encoded key size (~15-20 bytes)
 
-**Deletion Flow:**
+**Soft Delete Flow:**
 1. DELETE request received for key "foo"
 2. Tombstone written to active log with FlagDeleted=true
-3. Key removed from in-memory index (immediate deletion)
-4. On server restart: log replay processes tombstone and removes key from index
-5. During compaction: tombstone not copied (space reclaimed)
+3. Index entry updated with `Deleted=true` (soft delete, entry stays in index)
+4. GET operations check the `Deleted` flag and return 404 if true
+5. On server restart: log replay processes tombstone and creates entry with `Deleted=true`
+6. During compaction: entries with `Deleted=true` are skipped (not copied)
+7. After compaction: old segments with tombstones are removed (space reclaimed)
+
+**Why Soft Delete:**
+- Ensures compaction works correctly even when all keys are deleted
+- Allows tracking of disk space used by tombstones
+- Maintains consistency between runtime and post-restart states
+- Simplifies corruption handling (mark corrupted entries as deleted)
 
 **Example Log After Delete:**
 ```
@@ -219,18 +230,32 @@ When the active log reaches `MaxKeysPerSegment` writes:
 
 ### Index Structure
 
-In-memory hash map for O(1) lookups:
+In-memory hash map for O(1) lookups with soft-delete support:
 
 ```go
 map[string]*IndexEntry {
-    "key" -> {
+    "active_key" -> {
         SegmentFile: "seg2.log",
         Offset: 1000,
         Size: 256,
-        Checksum: [32]byte{...}
+        Checksum: [32]byte{...},
+        Deleted: false      // Live key
+    },
+    "deleted_key" -> {
+        SegmentFile: "seg3.log",
+        Offset: 2000,
+        Size: 18,
+        Checksum: [32]byte{...},
+        Deleted: true       // Soft-deleted (tombstone)
     }
 }
 ```
+
+**Key Points:**
+- Deleted entries remain in the index with `Deleted=true`
+- GET operations check the `Deleted` flag and return 404 if true
+- Compaction skips entries with `Deleted=true` to reclaim space
+- This ensures compaction works even when all keys are deleted
 
 ### Data Integrity
 
@@ -332,6 +357,7 @@ Compaction fails → Close new store → Restore from backup → Recreate writer
 
 Watch server logs for compaction messages:
 ```
+autoCompact: done                                      # Successful compaction completed
 autoCompact: backup failed: <error>                    # Backup failed, skipping
 autoCompact: creating new store failed: <error>        # Store creation failed
 autoCompact: failed to fetch <key>: <error>            # Data copy failed
@@ -339,7 +365,10 @@ autoCompact: failed to rename tmp db: <error>          # Swap failed, recovering
 autoCompact: skipping store replacement                # Cleanup after failure
 ```
 
-Successful compaction produces no error logs (silent success).
+**Success Indicator:**
+- Successful compaction logs `autoCompact: done` after completion
+- Deleted entries are removed from disk
+- Index is updated with the compacted store's metadata
 
 ## Design Decisions
 
@@ -368,20 +397,23 @@ Successful compaction produces no error logs (silent success).
 - **Value protection** - Detect corruption during reads
 - **Fail fast** - Identify corruption early rather than serving bad data
 
-### Why Tombstone-Based Deletion?
+### Why Soft-Delete with Tombstones?
 
 - **Append-only compatibility** - Deletions fit naturally into the log structure
 - **Crash safety** - Tombstones are replayed on recovery to restore delete operations
-- **Simple implementation** - No need for complex garbage collection during normal operation
-- **Eventual consistency** - Deleted entries fully removed during next compaction
+- **Compaction reliability** - Soft-deleted entries ensure compaction works even when all keys deleted
+- **Space tracking** - Index tracks disk space used by tombstones for monitoring
+- **Corruption handling** - Corrupted entries can be marked as deleted and cleaned up during compaction
+- **Consistency** - Same behavior before and after restart (deleted keys always have `Deleted=true`)
+- **Eventual cleanup** - Deleted entries physically removed during next compaction cycle
 
 ### Limitations
 
 - **Compaction blocks operations** - Global lock during compaction blocks all reads/writes/deletes
-- **Memory overhead** - Entire index must fit in RAM
+- **Memory overhead** - Entire index must fit in RAM (including soft-deleted entries until compaction)
 - **Single server** - No replication or clustering (yet)
 - **Windows file handles** - Requires delays for directory operations on Windows
-- **Tombstone overhead** - Deleted keys occupy space until next compaction cycle
+- **Tombstone overhead** - Deleted keys occupy both disk space and memory until next compaction cycle
 
 ### Compaction Trade-offs
 

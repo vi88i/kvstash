@@ -141,6 +141,7 @@ func (s *Store) logRotation() error {
 // Set stores a key-value pair in the store
 // The operation is thread-safe and validates key/value size limits
 // Automatically rotates to a new segment when the active log reaches MaxKeysPerSegment writes
+// If the key was previously deleted (soft-deleted), this operation undeletes it by setting Deleted=false
 // Returns validation errors (ErrEmptyKey, ErrKeyTooLarge, ErrValueTooLarge) for client errors
 // Returns other errors for server-side failures
 func (s *Store) Set(req *models.KVStashRequest) error {
@@ -173,6 +174,7 @@ func (s *Store) Set(req *models.KVStashRequest) error {
 		Offset:      metadata.Offset,
 		Size:        metadata.Size,
 		Checksum:    metadata.Checksum,
+		Deleted:     false,
 	}
 	s.activeLogCount++
 	log.Printf("Set: Added key=%v in segment=%v/%v", req.Key, s.dbPath, s.activeLog)
@@ -180,12 +182,20 @@ func (s *Store) Set(req *models.KVStashRequest) error {
 	return nil
 }
 
-// Delete removes a key from the store by writing a tombstone record
+// Delete removes a key from the store using a soft-delete approach with tombstones
 // The operation is thread-safe and writes a tombstone entry to the log with FlagDeleted
-// The tombstone contains the key but no value, allowing proper recovery after restart
-// During recovery, tombstones are replayed to remove keys that were deleted
-// Disk space is reclaimed during the next compaction cycle
-// Returns ErrKeyNotFound if the key doesn't exist (client error)
+// The key remains in the in-memory index but is marked with Deleted=true
+// This ensures that even when all keys are deleted, the index retains tombstone references
+// allowing compaction to properly clean up disk space
+//
+// Soft Delete Flow:
+//  1. Writes a tombstone record to the log with FlagDeleted marker
+//  2. Updates the index entry to point to the tombstone with Deleted=true
+//  3. During recovery, tombstones are replayed and entries are marked as deleted
+//  4. During compaction, entries with Deleted=true are skipped and not copied
+//  5. Physical disk space is reclaimed when old segments are removed during compaction
+//
+// Returns ErrKeyNotFound if the key doesn't exist or is already deleted (client error)
 // Returns validation errors (ErrEmptyKey, ErrKeyTooLarge) for client errors
 // Returns other errors for server-side failures
 func (s *Store) Delete(req *models.KVStashRequest) error {
@@ -196,8 +206,10 @@ func (s *Store) Delete(req *models.KVStashRequest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check if key exists in the index
-	if _, ok := s.index[req.Key]; !ok {
+	entry, ok := s.index[req.Key]
+
+	// Check if key exists and is not already deleted
+	if !ok || entry.Deleted {
 		return ErrKeyNotFound
 	}
 
@@ -213,14 +225,23 @@ func (s *Store) Delete(req *models.KVStashRequest) error {
 
 	// Write tombstone with FlagDeleted marker
 	flags := []int64{constants.FlagDeleted}
-	_, err = s.writer.Write(data, flags)
+	metadata, err := s.writer.Write(data, flags)
 	if err != nil {
 		return fmt.Errorf("Delete: failed to delete: %w", err)
 	}
 
-	// Remove from in-memory index
-	delete(s.index, req.Key)
+	// Mark entry as deleted in the index (soft delete)
+	// The entry remains in the index to track the tombstone location
+	// This ensures compaction can identify and skip deleted entries
+	s.index[req.Key] = &models.KVStashIndexEntry{
+		SegmentFile: s.activeLog,
+		Offset:      metadata.Offset,
+		Size:        metadata.Size,
+		Checksum:    metadata.Checksum,
+		Deleted:     true,
+	}
 	s.activeLogCount++
+	log.Printf("Delete: deleted key=%v", req.Key)
 
 	return nil
 }
@@ -235,7 +256,7 @@ func (s *Store) Get(req *models.KVStashRequest) (string, error) {
 	entry, ok := s.index[req.Key]
 	s.mu.RUnlock()
 
-	if !ok {
+	if !ok || entry.Deleted {
 		return "", ErrKeyNotFound
 	}
 
@@ -244,9 +265,7 @@ func (s *Store) Get(req *models.KVStashRequest) (string, error) {
 		// Check if this is a checksum mismatch error
 		if errors.Is(err, ErrChecksumMismatch) {
 			// Purge the corrupted entry from the index
-			s.mu.Lock()
-			delete(s.index, req.Key)
-			s.mu.Unlock()
+			_ = s.Delete(req)
 			log.Printf("Get: purged corrupted entry for key=%v due to checksum mismatch", req.Key)
 		}
 		return "", fmt.Errorf("Get: %w", err)
@@ -424,21 +443,17 @@ func (s *Store) readSegment(file *os.File, segment string) error {
 			return fmt.Errorf("readSegment: failed to deserialize value: %w", err)
 		}
 
-		// Check if this is a tombstone (deleted key)
-		// If so, remove the key from the index (in case it was added from earlier entries)
-		// This ensures deletions persist across restarts
-		if metadata.GetMetadataFlagValue(constants.FlagDeleted) {
-			log.Printf("readSegment: processing tombstone for key=%v", data.Key)
-			delete(s.index, data.Key)
-			continue
-		}
-
-		log.Printf("readSegment: read key=%v", data.Key)
+		// Add or update the entry in the index
+		// For tombstones (FlagDeleted=true), this creates an entry with Deleted=true
+		// For normal entries (FlagDeleted=false), this creates/updates an entry with Deleted=false
+		// Later entries in the log take precedence (e.g., a SET after DELETE undeletes the key)
+		log.Printf("readSegment: read key=%v (deleted=%v)", data.Key, metadata.GetMetadataFlagValue(constants.FlagDeleted))
 		s.index[data.Key] = &models.KVStashIndexEntry{
 			SegmentFile: segment,
 			Offset:      metadata.Offset,
 			Size:        metadata.Size,
 			Checksum:    metadata.Checksum,
+			Deleted:     metadata.GetMetadataFlagValue(constants.FlagDeleted),
 		}
 
 		if s.activeLog == segment {
@@ -517,6 +532,9 @@ func (oldStore *Store) autoCompact() {
 		copySuccess := true
 
 		// Step 4: Copy all current key-value pairs to the new store
+		// This excludes entries marked with Deleted=true (soft-deleted keys)
+		// Even if all keys are deleted, the index still contains tombstone entries
+		// which are skipped here, allowing compaction to clean up the disk space
 	compactLoop:
 		for _, keys := range keysGroupedBySegments {
 			noOfKeys := len(keys)
@@ -524,6 +542,14 @@ func (oldStore *Store) autoCompact() {
 				key := keys[i]
 
 				entry := oldStore.index[key]
+
+				// Skip soft-deleted entries (tombstones)
+				// These entries remain in the index but won't be copied to the new store
+				// This is how deleted keys are permanently removed during compaction
+				if entry.Deleted {
+					continue
+				}
+
 				// Fetch the current value from the old store
 				value, err := fetchValue(oldStore.dbPath, entry.SegmentFile, entry.Offset, entry.Size, entry.Checksum)
 				if err != nil {
@@ -616,6 +642,8 @@ func (oldStore *Store) autoCompact() {
 					if err := os.RemoveAll(constants.BackupDBPath); err != nil {
 						log.Printf("autoCompact: failed to delete backup: %v", err)
 					}
+
+					log.Println("autoCompact: done")
 				}
 			}
 		} else {
