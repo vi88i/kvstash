@@ -98,36 +98,36 @@ func NewStore(dbPath string) (*Store, error) {
 	return s, nil
 }
 
-// Set stores a key-value pair in the store
-// The operation is thread-safe and validates key/value size limits
-// Automatically rotates to a new segment when the active log reaches MaxKeysPerSegment writes
-// Returns validation errors (ErrEmptyKey, ErrKeyTooLarge, ErrValueTooLarge) for client errors
-// Returns other errors for server-side failures
-func (s *Store) Set(req *models.KVStashRequest) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if len(req.Key) == 0 {
+func validateKey(key string) error {
+	if len(key) == 0 {
 		return ErrEmptyKey
 	}
 
-	if len(req.Key) > constants.MaxKeySize {
+	if len(key) > constants.MaxKeySize {
 		return fmt.Errorf("%w (%d bytes)", ErrKeyTooLarge, constants.MaxKeySize)
 	}
 
-	if len(req.Value) > constants.MaxValueSize {
+	return nil
+}
+
+func validateValue(value string) error {
+	if len(value) > constants.MaxValueSize {
 		return fmt.Errorf("%w (%d bytes)", ErrValueTooLarge, constants.MaxValueSize)
 	}
 
+	return nil
+}
+
+func (s *Store) logRotation() error {
 	if s.activeLogCount >= constants.MaxKeysPerSegment {
 		if err := s.Close(); err != nil {
-			return fmt.Errorf("Set: failed to close active log - %v: %w", s.activeLog, err)
+			return fmt.Errorf("logRotation: failed to close active log - %v: %w", s.activeLog, err)
 		}
 
 		activeLog := fmt.Sprintf("%v%v%v", constants.SegmentNamePrefix, s.segmentCount+1, constants.SegmentNameExt)
 		writer, err := newLogWriter(s.dbPath, activeLog)
 		if err != nil {
-			return fmt.Errorf("Set: failed to create new active log - %v: %w", activeLog, err)
+			return fmt.Errorf("logRotation: failed to create new active log - %v: %w", activeLog, err)
 		}
 		s.writer = writer
 		s.activeLog = activeLog
@@ -135,13 +135,37 @@ func (s *Store) Set(req *models.KVStashRequest) error {
 		s.segmentCount++
 	}
 
+	return nil
+}
+
+// Set stores a key-value pair in the store
+// The operation is thread-safe and validates key/value size limits
+// Automatically rotates to a new segment when the active log reaches MaxKeysPerSegment writes
+// Returns validation errors (ErrEmptyKey, ErrKeyTooLarge, ErrValueTooLarge) for client errors
+// Returns other errors for server-side failures
+func (s *Store) Set(req *models.KVStashRequest) error {
+	if err := validateKey(req.Key); err != nil {
+		return err
+	}
+	
+	if err := validateValue(req.Value); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.logRotation(); err != nil {
+		return fmt.Errorf("Set: failed to rotate log: %w", err)
+	}
+
 	data, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("Set: failed to serialize: %w", err)
 	}
-	metadata, err := s.writer.Write(data)
+	metadata, err := s.writer.Write(data, nil)
 	if err != nil {
-		return fmt.Errorf("Set: %w", err)
+		return fmt.Errorf("Set: failed to write: %w", err)
 	}
 
 	s.index[req.Key] = &models.KVStashIndexEntry{
@@ -152,6 +176,51 @@ func (s *Store) Set(req *models.KVStashRequest) error {
 	}
 	s.activeLogCount++
 	log.Printf("Set: Added key=%v in segment=%v/%v", req.Key, s.dbPath, s.activeLog)
+
+	return nil
+}
+
+// Delete removes a key from the store by writing a tombstone record
+// The operation is thread-safe and writes a tombstone entry to the log with FlagDeleted
+// The tombstone contains the key but no value, allowing proper recovery after restart
+// During recovery, tombstones are replayed to remove keys that were deleted
+// Disk space is reclaimed during the next compaction cycle
+// Returns ErrKeyNotFound if the key doesn't exist (client error)
+// Returns validation errors (ErrEmptyKey, ErrKeyTooLarge) for client errors
+// Returns other errors for server-side failures
+func (s *Store) Delete(req *models.KVStashRequest) error {
+	if err := validateKey(req.Key); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if key exists in the index
+	if _, ok := s.index[req.Key]; !ok {
+		return ErrKeyNotFound
+	}
+
+	if err := s.logRotation(); err != nil {
+		return fmt.Errorf("Delete: failed to rotate logs: %w", err)
+	}
+
+	// Marshal the key (value is empty) to create the tombstone
+	data, err := json.Marshal(&models.KVStashRequest{Key: req.Key})
+	if err != nil {
+		return fmt.Errorf("Delete: failed to serialize: %w", err)
+	}
+
+	// Write tombstone with FlagDeleted marker
+	flags := []int64{constants.FlagDeleted}
+	_, err = s.writer.Write(data, flags)
+	if err != nil {
+		return fmt.Errorf("Delete: failed to delete: %w", err)
+	}
+
+	// Remove from in-memory index
+	delete(s.index, req.Key)
+	s.activeLogCount++
 
 	return nil
 }
@@ -353,6 +422,15 @@ func (s *Store) readSegment(file *os.File, segment string) error {
 		var data models.KVStashRequest
 		if err := json.Unmarshal(dataBytes, &data); err != nil {
 			return fmt.Errorf("readSegment: failed to deserialize value: %w", err)
+		}
+
+		// Check if this is a tombstone (deleted key)
+		// If so, remove the key from the index (in case it was added from earlier entries)
+		// This ensures deletions persist across restarts
+		if metadata.GetMetadataFlagValue(constants.FlagDeleted) {
+			log.Printf("readSegment: processing tombstone for key=%v", data.Key)
+			delete(s.index, data.Key)
+			continue
 		}
 
 		log.Printf("readSegment: read key=%v", data.Key)

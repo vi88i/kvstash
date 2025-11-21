@@ -68,15 +68,16 @@ func newLogWriter(dbPath string, activeLog string) (*LogWriter, error) {
 // Automatically rolls back the offset on partial write failures
 // Returns the metadata containing offset, size, and checksums
 // Thread-safe: uses mutex to serialize concurrent writes
-func (lw *LogWriter) Write(data []byte) (*models.KVStashMetadata, error) {
+func (lw *LogWriter) Write(data []byte, flags []int64) (*models.KVStashMetadata, error) {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
 
+	metadataFlag := models.ComputeMetadataFlag(flags)
 	metaDataOffset := lw.offset
 	valueOffset := metaDataOffset + constants.MetadataSize
 	valueSize := int64(len(data))
 	metadata := models.KVStashMetadata{}
-	if err := metadata.ComputeChecksum(valueOffset, valueSize, lw.name, data); err != nil {
+	if err := metadata.ComputeChecksum(valueOffset, valueSize, metadataFlag, lw.name, data); err != nil {
 		return &metadata, fmt.Errorf("Write: metadata compute failed: %w", err)
 	}
 

@@ -17,6 +17,9 @@ type KVStashMetadata struct {
 	// Size is the length in bytes of the value data
 	Size int64
 
+	// Flags is the tombstone indicator (during compaction delete from the logs)
+	Flags int64
+
 	// SegmentFile is the name of the log file (fixed 32-byte array)
 	SegmentFile [32]byte
 
@@ -30,9 +33,9 @@ type KVStashMetadata struct {
 // ComputeChecksum calculates and sets both the value checksum and metadata checksum
 // It uses BigEndian encoding (network standard) for all fields
 //
-// The value checksum is SHA-256(offset || size || fileName || data)
-// The metadata checksum is SHA-256(offset || size || fileName || valueChecksum)
-func (m *KVStashMetadata) ComputeChecksum(offset int64, size int64, fileName string, data []byte) error {
+// The value checksum is SHA-256(offset || size || fileName || data || isDeleted)
+// The metadata checksum is SHA-256(offset || size || fileName || isDeleted || valueChecksum)
+func (m *KVStashMetadata) ComputeChecksum(offset int64, size int64, flags int64, fileName string, data []byte) error {
 	fileNameBytes, err := fitFileName(fileName)
 	if err != nil {
 		return fmt.Errorf("ComputeChecksum: %w", err)
@@ -46,6 +49,9 @@ func (m *KVStashMetadata) ComputeChecksum(offset int64, size int64, fileName str
 	}
 	if err := binary.Write(&buf1, binary.BigEndian, size); err != nil {
 		return fmt.Errorf("ComputeChecksum: failed to write size: %w", err)
+	}
+	if err := binary.Write(&buf1, binary.BigEndian, flags); err != nil {
+		return fmt.Errorf("ComputeChecksum: failed to write flags: %w", err)
 	}
 	if err := binary.Write(&buf1, binary.BigEndian, fileNameBytes); err != nil {
 		return fmt.Errorf("ComputeChecksum: failed to write fileName: %w", err)
@@ -62,6 +68,9 @@ func (m *KVStashMetadata) ComputeChecksum(offset int64, size int64, fileName str
 	if err := binary.Write(&buf2, binary.BigEndian, size); err != nil {
 		return fmt.Errorf("ComputeChecksum: failed to write size for metadata: %w", err)
 	}
+	if err := binary.Write(&buf2, binary.BigEndian, flags); err != nil {
+		return fmt.Errorf("ComputeChecksum: failed to write flags: %w", err)
+	}
 	if err := binary.Write(&buf2, binary.BigEndian, fileNameBytes); err != nil {
 		return fmt.Errorf("ComputeChecksum: failed to write fileName for metadata: %w", err)
 	}
@@ -72,6 +81,7 @@ func (m *KVStashMetadata) ComputeChecksum(offset int64, size int64, fileName str
 
 	m.Offset = offset
 	m.Size = size
+	m.Flags = flags
 	m.SegmentFile = fileNameBytes
 	m.Checksum = valueChecksum
 	m.MChecksum = metadataChecksum
@@ -90,10 +100,11 @@ func (m *KVStashMetadata) Serialize() []byte {
 
 	binary.BigEndian.PutUint64(out[0:8], uint64(m.Offset))
 	binary.BigEndian.PutUint64(out[8:16], uint64(m.Size))
+	binary.BigEndian.PutUint64(out[16:24], uint64(m.Flags))
 
-	copy(out[16:48], m.SegmentFile[:])
-	copy(out[48:80], m.Checksum[:])
-	copy(out[80:112], m.MChecksum[:])
+	copy(out[24:56], m.SegmentFile[:])
+	copy(out[56:88], m.Checksum[:])
+	copy(out[88:120], m.MChecksum[:])
 
 	return out[:]
 }
@@ -108,10 +119,11 @@ func (m *KVStashMetadata) Deserialize(data []byte) error {
 
 	m.Offset = int64(binary.BigEndian.Uint64(data[0:8]))
 	m.Size = int64(binary.BigEndian.Uint64(data[8:16]))
+	m.Flags = int64(binary.BigEndian.Uint64(data[16:24]))
 
-	copy(m.SegmentFile[:], data[16:48])
-	copy(m.Checksum[:], data[48:80])
-	copy(m.MChecksum[:], data[80:112])
+	copy(m.SegmentFile[:], data[24:56])
+	copy(m.Checksum[:], data[56:88])
+	copy(m.MChecksum[:], data[88:120])
 
 	return nil
 }
@@ -126,6 +138,9 @@ func (m *KVStashMetadata) ValidateMChecksum() error {
 	}
 	if err := binary.Write(&buf, binary.BigEndian, m.Size); err != nil {
 		return fmt.Errorf("ValidateMChecksum: failed to write size: %w", err)
+	}
+	if err := binary.Write(&buf, binary.BigEndian, m.Flags); err != nil {
+		return fmt.Errorf("ComputeChecksum: failed to write flags: %w", err)
 	}
 	if err := binary.Write(&buf, binary.BigEndian, m.SegmentFile); err != nil {
 		return fmt.Errorf("ValidateMChecksum: failed to write segmentFile: %w", err)
@@ -154,3 +169,22 @@ func fitFileName(name string) ([32]byte, error) {
 	copy(out[:], name)
 	return out, nil
 }
+
+func (m *KVStashMetadata) GetMetadataFlagValue(flag int64) bool {
+	return ((1 << flag) & m.Flags) > 0
+}
+
+func ComputeMetadataFlag(flags []int64) int64 {
+	value := int64(0)
+
+	if flags == nil {
+		return value
+	}
+
+	for i := range flags {
+		value = (value | 1 << flags[i])
+	}
+
+	return value
+}
+

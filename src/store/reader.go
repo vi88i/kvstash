@@ -67,7 +67,7 @@ func fetchValue(dbPath string, fileName string, offset int64, size int64, checks
 
 	// Validate data integrity by recomputing and comparing checksums
 	var metadata models.KVStashMetadata
-	metadata.ComputeChecksum(offset, size, fileName, buf)
+	metadata.ComputeChecksum(offset, size, 0, fileName, buf)
 	if metadata.Checksum != checksum {
 		return "", fmt.Errorf("fetchValue: %w (expected %x, got %x)",
 			ErrChecksumMismatch, checksum, metadata.Checksum)

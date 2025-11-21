@@ -15,7 +15,7 @@ import (
 var kvStore *store.Store
 
 // apiHandler processes HTTP requests for key-value operations
-// Supports POST for setting values and GET for retrieving values
+// Supports POST for setting values, GET for retrieving values, and DELETE for removing keys
 // Returns JSON responses with success status and data
 func apiHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -34,7 +34,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate HTTP method
-	if !slices.Contains([]string{http.MethodPost, http.MethodGet}, r.Method) {
+	if !slices.Contains([]string{http.MethodPost, http.MethodGet, http.MethodDelete}, r.Method) {
 		sendResponse(http.StatusMethodNotAllowed, false, "", nil)
 		return
 	}
@@ -90,6 +90,23 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			Value: value,
 		})
 
+	case http.MethodDelete:
+		// Attempt to delete key
+		err := kvStore.Delete(&reqData)
+		if err != nil {
+			log.Printf("apiHandler: failed to delete key: %v", err)
+			// Check if this is a validation error (400), not found (404), or server error (500)
+			if errors.Is(err, store.ErrEmptyKey) || errors.Is(err, store.ErrKeyTooLarge) {
+				sendResponse(http.StatusBadRequest, false, err.Error(), nil)
+			} else if errors.Is(err, store.ErrKeyNotFound) {
+				sendResponse(http.StatusNotFound, false, "key not found", nil)
+			} else {
+				sendResponse(http.StatusInternalServerError, false, "delete failed", nil)
+			}
+			return
+		}
+
+		sendResponse(http.StatusOK, true, "", nil)
 	default:
 		sendResponse(http.StatusInternalServerError, false, "unable to process request", nil)
 	}

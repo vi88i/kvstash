@@ -23,10 +23,11 @@ A high-performance, persistent key-value store inspired by Bitcask. KVStash prov
 
 - **Append-only log design** - Simple, fast writes with strong durability
 - **In-memory index** - O(1) lookups without scanning disk
+- **Tombstone-based deletion** - Delete keys with persistent tombstone records
 - **Automatic log rotation** - Prevents unbounded file growth
 - **Automatic compaction** - Periodic garbage collection reclaims disk space
 - **Dual checksum validation** - SHA-256 checksums for both metadata and data
-- **Thread-safe operations** - Concurrent reads and writes supported
+- **Thread-safe operations** - Concurrent reads, writes, and deletes supported
 - **Corruption detection** - Automatic detection and handling of corrupted data
 - **Graceful degradation** - Tolerates corruption in active log during crash recovery
 - **Crash recovery** - Automatic backup and recovery mechanisms
@@ -110,6 +111,37 @@ CompactionInterval = 60       // Compaction interval (seconds)
 - `404 Not Found` - Key doesn't exist
 - `500 Internal Server Error` - Read failure or data corruption
 
+### Delete a Key
+
+**Endpoint:** `DELETE /kvstash`
+
+**Request:**
+```json
+{
+  "key": "username"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "success": true,
+  "message": "",
+  "data": null
+}
+```
+
+**Error Responses:**
+- `400 Bad Request` - Empty key or key too large
+- `404 Not Found` - Key doesn't exist
+- `500 Internal Server Error` - Delete failure
+
+**How Deletion Works:**
+- Writes a tombstone record to the append-only log with the `FlagDeleted` marker
+- Removes the key from the in-memory index immediately
+- Tombstone is replayed during recovery to ensure deletions persist across restarts
+- Disk space is reclaimed during the next compaction cycle
+
 ### Example Usage
 
 ```bash
@@ -127,6 +159,11 @@ curl -X GET http://localhost:8080/kvstash \
 curl -X POST http://localhost:8080/kvstash \
   -H "Content-Type: application/json" \
   -d '{"key":"user:1","value":"Bob"}'
+
+# Delete a key
+curl -X DELETE http://localhost:8080/kvstash \
+  -H "Content-Type: application/json" \
+  -d '{"key":"user:1"}'
 ```
 
 ## Architecture
@@ -139,12 +176,36 @@ KVStash uses an append-only log with the following structure:
 [Metadata 112 bytes][Value N bytes][Metadata 112 bytes][Value M bytes]...
 ```
 
-**Metadata Structure (112 bytes):**
+**Metadata Structure (120 bytes):**
 - Offset (8 bytes) - Byte position of value data
 - Size (8 bytes) - Length of value data
+- Flags (8 bytes) - Operation flags (bit 0 = deleted/tombstone)
 - SegmentFile (32 bytes) - Name of containing file
 - Checksum (32 bytes) - SHA-256 of value data
 - MChecksum (32 bytes) - SHA-256 of metadata
+
+### Tombstone Deletion
+
+When a key is deleted, a tombstone record is written to the log:
+
+**Tombstone Structure:**
+- Metadata with `FlagDeleted` (bit 0 set)
+- Value contains only the key: `{"key":"username","value":""}`
+- Size reflects the JSON-encoded key size (~15-20 bytes)
+
+**Deletion Flow:**
+1. DELETE request received for key "foo"
+2. Tombstone written to active log with FlagDeleted=true
+3. Key removed from in-memory index (immediate deletion)
+4. On server restart: log replay processes tombstone and removes key from index
+5. During compaction: tombstone not copied (space reclaimed)
+
+**Example Log After Delete:**
+```
+[Metadata][{"key":"foo","value":"bar"}]     ← Original SET
+[Metadata][{"key":"foo","value":"baz"}]     ← UPDATE
+[Metadata+FlagDeleted][{"key":"foo","value":""}]  ← DELETE (tombstone)
+```
 
 ### Log Rotation
 
@@ -208,9 +269,14 @@ KVStash implements periodic compaction to reclaim disk space from old/updated va
 
 1. **Backup Creation** - Database copied to `BackupDBPath` before any modifications
 2. **New Store Creation** - Temporary store created at `TmpDBPath`
-3. **Data Copy** - Only current (non-stale) key-value pairs copied to new store
+3. **Data Copy** - Only current (non-deleted, non-stale) key-value pairs copied to new store
 4. **Atomic Swap** - Old database replaced with compacted version
 5. **Cleanup** - Backup removed on success, restored on failure
+
+**What Gets Removed:**
+- Old values for updated keys
+- Tombstones for deleted keys
+- Deleted key data (keys not in current index)
 
 **Lock Strategy:**
 - Global store lock held during entire compaction cycle
@@ -225,9 +291,11 @@ KVStash implements periodic compaction to reclaim disk space from old/updated va
 
 **Disk Space Savings:**
 - Eliminates old values for updated keys
+- Removes tombstones and deleted key data
 - Removes stale entries from rotated segments
 - Defragments data across fewer segment files
 - Example: 1000 writes to same key → compacted to 1 entry
+- Example: Deleted key with tombstone → completely removed
 
 **Recovery Mechanisms:**
 
@@ -300,13 +368,20 @@ Successful compaction produces no error logs (silent success).
 - **Value protection** - Detect corruption during reads
 - **Fail fast** - Identify corruption early rather than serving bad data
 
+### Why Tombstone-Based Deletion?
+
+- **Append-only compatibility** - Deletions fit naturally into the log structure
+- **Crash safety** - Tombstones are replayed on recovery to restore delete operations
+- **Simple implementation** - No need for complex garbage collection during normal operation
+- **Eventual consistency** - Deleted entries fully removed during next compaction
+
 ### Limitations
 
-- **No deletion** - Keys cannot be deleted (only updated)
-- **Compaction blocks operations** - Global lock during compaction blocks all reads/writes
+- **Compaction blocks operations** - Global lock during compaction blocks all reads/writes/deletes
 - **Memory overhead** - Entire index must fit in RAM
 - **Single server** - No replication or clustering (yet)
 - **Windows file handles** - Requires delays for directory operations on Windows
+- **Tombstone overhead** - Deleted keys occupy space until next compaction cycle
 
 ### Compaction Trade-offs
 
@@ -334,92 +409,16 @@ Successful compaction produces no error logs (silent success).
 - Run compaction during low-traffic windows
 - Consider lock-free compaction (future enhancement)
 
-## Load Testing
-
-KVStash includes a comprehensive load testing tool to measure performance and observe compaction impact.
-
-### Quick Start
-
-```bash
-cd loadtest
-go build -o loadtest.exe loadtest.go
-
-# Run default test (10 workers, 5 minutes, 50% reads)
-./loadtest.exe
-
-# Run custom test
-./loadtest.exe -c 50 -d 5m -r 0.7 -s 2048
-
-# Run full test suite
-./run_tests.bat
-```
-
-### Usage Examples
-
-```bash
-# High concurrency test
-./loadtest.exe -c 100 -d 5m
-
-# Write-heavy workload (80% writes)
-./loadtest.exe -c 50 -d 5m -r 0.2
-
-# Read-heavy workload (90% reads)
-./loadtest.exe -c 100 -d 5m -r 0.9
-
-# Large values (100KB)
-./loadtest.exe -c 20 -d 5m -s 102400
-
-# Stress test
-./loadtest.exe -c 200 -d 5m -s 512
-```
-
-### Metrics Collected
-
-- **Operations:** Total ops, throughput (ops/sec), success rate
-- **Latency:** Min, Max, Mean, Median, P95, P99 (milliseconds)
-- **Breakdown:** Separate stats for reads and writes
-
-### Observing Compaction Impact
-
-Run tests for **5+ minutes** to see multiple compaction cycles:
-
-```bash
-./loadtest.exe -c 50 -d 5m -r 0.5 -s 1024
-```
-
-**What to look for:**
-- **P95/P99 latency spikes** - Compaction blocking operations
-- **Throughput drops** - Temporary decrease during lock acquisition
-- **Success rate dips** - Timeout errors during compaction
-- **Log messages** - Compaction errors or completion messages
-
-**Example output:**
-```
-Total Operations: 45234 (753.90 ops/sec)
-
-Write Latency (ms):
-  Mean:   15.234
-  P95:    34.567    <- Normal latency
-  P99:    67.890    <- Compaction spike
-
-Read Latency (ms):
-  Mean:   8.456
-  P95:    18.901
-  P99:    34.567
-```
-
-See `loadtest/README.md` for complete documentation.
-
 ## Future Enhancements
 
 - [ ] Lock-free compaction (background incremental compaction)
-- [ ] Delete operation support (tombstones)
 - [ ] Range queries
 - [ ] Point-in-time snapshots
 - [ ] Replication and clustering
 - [ ] Compression
 - [ ] Bloom filters for faster negative lookups
 - [ ] Metrics endpoint (Prometheus format)
+- [ ] Optimized tombstone handling (batch deletion during compaction)
 
 ## License
 
