@@ -34,3 +34,6 @@ go.work.sum
 TODO
 
 db/
+tmp_db/
+bkp_db/
+loadtest/

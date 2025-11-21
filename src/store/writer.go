@@ -80,7 +80,6 @@ func (lw *LogWriter) Write(data []byte) (*models.KVStashMetadata, error) {
 		return &metadata, fmt.Errorf("Write: metadata compute failed: %w", err)
 	}
 
-	log.Printf("Write: Writing metadata at %v", metaDataOffset)
 	n, err := lw.file.WriteAt(metadata.Serialize(), metaDataOffset)
 	if err != nil {
 		return &metadata, fmt.Errorf("Write: metadata write failed: %w", err)

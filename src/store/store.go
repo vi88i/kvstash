@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // Validation errors that should result in HTTP 400 responses
@@ -90,6 +91,10 @@ func NewStore(dbPath string) (*Store, error) {
 	}
 	s.writer = writer
 
+	if dbPath == constants.DBPath {
+		go s.autoCompact()
+	}
+
 	return s, nil
 }
 
@@ -146,6 +151,7 @@ func (s *Store) Set(req *models.KVStashRequest) error {
 		Checksum:    metadata.Checksum,
 	}
 	s.activeLogCount++
+	log.Printf("Set: Added key=%v in segment=%v/%v", req.Key, s.dbPath, s.activeLog)
 
 	return nil
 }
@@ -183,8 +189,23 @@ func (s *Store) Get(req *models.KVStashRequest) (string, error) {
 // buildIndex reconstructs the in-memory index by scanning all segment files
 // It reads all entries, validates metadata checksums only, and populates the index
 // Tolerates corruption in the active log but fails on corruption in archived segments
+// Attempts recovery from backup if database is missing but backup exists
 // Returns an error if segment files cannot be opened or read
 func (s *Store) buildIndex() error {
+	// Check if backup exists and database doesn't - recovery scenario
+	if _, err := os.Stat(s.dbPath); os.IsNotExist(err) {
+		if _, backupErr := os.Stat(constants.BackupDBPath); backupErr == nil {
+			log.Printf("buildIndex: database missing but backup exists, attempting recovery")
+			if err := copyDB(constants.BackupDBPath, s.dbPath); err != nil {
+				panic(fmt.Sprintf("buildIndex: failed to restore from backup: %v", err))
+			}
+			if err := os.RemoveAll(constants.BackupDBPath); err != nil {
+				log.Printf("buildIndex: failed to delete backup after recovery: %v", err)
+			}
+			log.Printf("buildIndex: successfully recovered from backup")
+		}
+	}
+
 	segments, err := s.getSegmentFiles()
 	if err != nil {
 		return fmt.Errorf("buildIndex: failed fetch segment files: %w", err)
@@ -345,5 +366,196 @@ func (s *Store) readSegment(file *os.File, segment string) error {
 		if s.activeLog == segment {
 			s.activeLogCount++
 		}
+	}
+}
+
+// autoCompact runs periodic compaction to reclaim disk space and optimize storage
+// This goroutine is automatically started only for the main database store (not for temporary stores)
+//
+// Compaction Process:
+//  1. Creates a backup of the current database to BackupDBPath
+//  2. Creates a new store at TmpDBPath
+//  3. Copies all current key-value pairs from the old store to the new store
+//     (this eliminates old values for updated keys and defragments the data)
+//  4. Attempts to replace the old database with the compacted one:
+//     - Closes the old store writer
+//     - Deletes the old database directory
+//     - Renames TmpDBPath to DBPath
+//  5. On success: Updates store references and cleans up backup
+//  6. On failure: Recovers from backup and panics if recovery fails
+//
+// Lock Strategy:
+// The store mutex (oldStore.mu) is held for the entire compaction cycle to prevent
+// concurrent reads/writes during the database swap operation. This ensures data consistency
+// but blocks all Get/Set operations during compaction.
+//
+// Error Handling:
+// - Backup creation failure: Skip this compaction cycle and retry next interval
+// - New store creation failure: Skip this compaction cycle and retry next interval
+// - Data copy failure: Clean up resources (newStore, TmpDBPath, BackupDBPath) and retry next cycle
+// - Database swap failure: Attempt recovery from backup, panic if recovery fails
+// - Recovery failure: Panic (database is in inconsistent state, cannot continue safely)
+//
+// Resource Cleanup:
+// - On success: BackupDBPath is removed
+// - On copy failure: newStore, TmpDBPath, and BackupDBPath are cleaned up
+// - On swap failure with successful recovery: TmpDBPath is removed, backup is restored
+//
+// This function runs indefinitely in a loop with CompactionInterval second delays between cycles.
+func (oldStore *Store) autoCompact() {
+	for {
+		time.Sleep(time.Second * constants.CompactionInterval)
+
+		oldStore.mu.Lock()
+		// Step 1: Create backup before any modifications
+		if err := copyDB(constants.DBPath, constants.BackupDBPath); err != nil {
+			log.Printf("autoCompact: backup failed: %v", err)
+			oldStore.mu.Unlock()
+			continue
+		}
+
+		// Step 2: Create new store at temporary location
+		// Note: NewStore will NOT spawn autoCompact goroutine because dbPath != constants.DBPath
+		newStore, err := NewStore(constants.TmpDBPath)
+		if err != nil {
+			log.Printf("autoCompact: creating new store failed: %v", err)
+			oldStore.mu.Unlock()
+			continue
+		}
+
+		// Step 3: Group keys by segment file for efficient reading
+		// This allows us to read from each segment file sequentially
+		var keysGroupedBySegments map[string][]string = make(map[string][]string)
+		for key, entry := range oldStore.index {
+			segment := entry.SegmentFile
+			_, ok := keysGroupedBySegments[segment]
+			if !ok {
+				keysGroupedBySegments[segment] = make([]string, 0)
+			}
+
+			keysGroupedBySegments[segment] = append(keysGroupedBySegments[segment], key)
+		}
+
+		copySuccess := true
+
+		// Step 4: Copy all current key-value pairs to the new store
+	compactLoop:
+		for _, keys := range keysGroupedBySegments {
+			noOfKeys := len(keys)
+			for i := range noOfKeys {
+				key := keys[i]
+
+				entry := oldStore.index[key]
+				// Fetch the current value from the old store
+				value, err := fetchValue(oldStore.dbPath, entry.SegmentFile, entry.Offset, entry.Size, entry.Checksum)
+				if err != nil {
+					log.Printf("autoCompact: failed to fetch %v: %v", key, err)
+					copySuccess = false
+					break compactLoop
+				}
+
+				// Write the key-value pair to the new store
+				req := &models.KVStashRequest{
+					Key:   key,
+					Value: value,
+				}
+				if err := newStore.Set(req); err != nil {
+					log.Printf("autoCompact: failed to set key in new store %v: %v", key, err)
+					copySuccess = false
+					break compactLoop
+				}
+			}
+		}
+
+		if copySuccess {
+			recover := false
+
+			// Close old store writer to release file handles
+			if err := oldStore.Close(); err != nil {
+				log.Printf("autoCompact: failed to close old store writer: %v", err)
+				recover = true
+			}
+
+			// Close new store writer before rename (Windows requires this)
+			if err := newStore.Close(); err != nil {
+				log.Printf("autoCompact: failed to close new store writer: %v", err)
+				recover = true
+			}
+
+			// Remove old database directory
+			if err := os.RemoveAll(constants.DBPath); err != nil {
+				log.Printf("autoCompact: failed delete old store: %v", err)
+				recover = true
+			}
+
+			// Rename tmp database to main database location
+			if err := os.Rename(constants.TmpDBPath, constants.DBPath); err != nil {
+				log.Printf("autoCompact: failed to rename tmp db: %v", err)
+				recover = true
+			}
+
+			if recover {
+				// Clean up temporary database directory
+				if err := os.RemoveAll(constants.TmpDBPath); err != nil {
+					log.Printf("autoCompact: failed to remove tmp db: %v", err)
+				}
+
+				// Copy backup DB back to active DB
+				if err := copyDB(constants.BackupDBPath, constants.DBPath); err != nil {
+					panic(err)
+				}
+
+				// Recreate writer for the restored database
+				writer, err := newLogWriter(constants.DBPath, oldStore.activeLog)
+				if err != nil {
+					panic(err)
+				}
+				oldStore.writer = writer
+			} else {
+				// Success path - rename succeeded, newStore is now at DBPath
+				// Reopen the writer at the new location
+				writer, err := newLogWriter(constants.DBPath, newStore.activeLog)
+				if err != nil {
+					log.Printf("autoCompact: failed to reopen writer after rename: %v", err)
+					// Try to recover from backup
+					if err := copyDB(constants.BackupDBPath, constants.DBPath); err != nil {
+						panic(err)
+					}
+					writer, err = newLogWriter(constants.DBPath, oldStore.activeLog)
+					if err != nil {
+						panic(err)
+					}
+					oldStore.writer = writer
+				} else {
+					// Successfully reopened writer, update store references
+					oldStore.index = newStore.index
+					oldStore.activeLog = newStore.activeLog
+					oldStore.activeLogCount = newStore.activeLogCount
+					oldStore.segmentCount = newStore.segmentCount
+					oldStore.writer = writer
+
+					// Clean up backup after successful compaction
+					if err := os.RemoveAll(constants.BackupDBPath); err != nil {
+						log.Printf("autoCompact: failed to delete backup: %v", err)
+					}
+				}
+			}
+		} else {
+			if err := newStore.Close(); err != nil {
+				log.Printf("autoCompact: failed to close new store writer: %v", err)
+			}
+
+			if err := os.RemoveAll(constants.BackupDBPath); err != nil {
+				log.Printf("autoCompact: failed delete - %v: %v", constants.BackupDBPath, err)
+			}
+
+			if err := os.RemoveAll(constants.TmpDBPath); err != nil {
+				log.Printf("autoCompact: failed to delete - %v: %v", constants.TmpDBPath, err)
+			}
+
+			log.Printf("autoCompact: skipping store replacement")
+		}
+
+		oldStore.mu.Unlock()
 	}
 }

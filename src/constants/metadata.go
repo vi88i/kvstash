@@ -6,9 +6,6 @@ const (
 	// Layout: 8 bytes (offset) + 8 bytes (size) + 32 bytes (segment file) + 32 bytes (checksum) + 32 bytes (metadata checksum) = 112 bytes
 	MetadataSize = 112
 
-	// DBPath is the directory path where database files are stored
-	DBPath = "../db"
-
 	// MaxKeySize is the maximum allowed size in bytes for a key
 	MaxKeySize = 256 // 256 bytes
 
