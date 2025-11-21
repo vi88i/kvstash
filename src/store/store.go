@@ -147,7 +147,7 @@ func (s *Store) Set(req *models.KVStashRequest) error {
 	if err := validateKey(req.Key); err != nil {
 		return err
 	}
-	
+
 	if err := validateValue(req.Value); err != nil {
 		return err
 	}

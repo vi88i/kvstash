@@ -182,9 +182,8 @@ func ComputeMetadataFlag(flags []int64) int64 {
 	}
 
 	for i := range flags {
-		value = (value | 1 << flags[i])
+		value = (value | 1<<flags[i])
 	}
 
 	return value
 }
-
